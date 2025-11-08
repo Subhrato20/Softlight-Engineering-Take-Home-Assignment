@@ -1,0 +1,5 @@
+2025/11/08-00:27:30.184 74c3c1 Creating DB /Users/subhratosom/Softlight-Engineering-Take-Home-Assignment/src/agentA/browser_data/Default/Local Storage/leveldb since it was missing.
+2025/11/08-00:27:30.189 74c3c1 Reusing MANIFEST /Users/subhratosom/Softlight-Engineering-Take-Home-Assignment/src/agentA/browser_data/Default/Local Storage/leveldb/MANIFEST-000001
+2025/11/08-00:27:47.568 74c3c8 Level-0 table #5: started
+2025/11/08-00:27:47.573 74c3c8 Level-0 table #5: 304684 bytes OK
+2025/11/08-00:27:47.574 74c3c8 Delete type=0 #3
