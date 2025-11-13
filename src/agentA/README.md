@@ -1,36 +1,34 @@
 # Agent A: Web Automation Executor
 
-Agent A executes structured task plans from Agent B using browser automation with Playwright and GPT-4o function calling.
+Agent A is the execution engine that takes structured TaskPlans from Agent B and performs web automation tasks using **browser-use**. 
+
+## Why browser-use?
+
+- **Built-in feedback loop**: Automatically handles retries and error recovery
+- **Intelligent element finding**: Uses LLM to find elements semantically
+- **Simple API**: No need for complex selector logic or manual element finding
+- **Much less code**: ~180 lines vs 600+ lines with manual Playwright
 
 ## Features
 
-- **Semantic Element Finding**: Uses GPT-4o to find elements based on natural language descriptions
-- **Playwright Integration**: Full browser automation capabilities
-- **Screenshot Capture**: Automatic screenshot capture at key moments
-- **State Evaluation**: LLM-powered state change detection
-- **Function Calling**: GPT-4o with tool calling for intelligent execution
+- **Browser Automation**: Uses browser-use library (built on Playwright)
+- **Automatic Element Finding**: browser-use uses LLM to find elements by description
+- **Feedback Loop**: Built-in retry and error handling
+- **Screenshot Capture**: Automatically captures screenshots at key UI states
+- **Action Support**: Supports all action types from Agent B by converting them to natural language
 
 ## Installation
 
+Agent A requires browser-use. Install it with:
+
 ```bash
 pip install -r requirements.txt
-playwright install chromium  # Install browser binaries
 ```
 
-## Architecture
+Set your OpenAI API key (optional, but recommended for better element finding):
 
-```
-src/agentA/
-├── agent_a.py              # Main Agent A class
-├── playwright/             # Playwright tools
-│   ├── browser.py          # Browser management
-│   ├── navigation.py       # Navigation tools
-│   ├── page_analyzer.py    # Page content extraction
-│   ├── element_finder.py   # Semantic element finding (LLM-powered)
-│   ├── interactions.py      # Click, type, select, etc.
-│   ├── state_evaluator.py   # State checking and evaluation
-│   └── screenshot.py       # Screenshot capture
-└── models.py               # Pydantic models (if needed)
+```bash
+export OPENAI_API_KEY="sk-...your_key..."
 ```
 
 ## Usage
@@ -38,111 +36,109 @@ src/agentA/
 ### Basic Usage
 
 ```python
-from src.agentB import AgentB
-from src.agentA import AgentA
+from src.agentB.agent_b import AgentB
+from src.agentA.agent_a import AgentA
 
-# Step 1: Generate plan with Agent B
-agent_b = AgentB()
-plan = agent_b.plan("Create a new project in Linear")
+# Generate plan with Agent B
+planner = AgentB()
+plan = planner.plan("Create a new project in Linear")
 
-# Step 2: Execute plan with Agent A
-agent_a = AgentA(headless=False)  # Set headless=True for background execution
-result = agent_a.execute(plan)
+# Execute plan with Agent A
+executor = AgentA(headless=False)
+results = executor.execute_plan(plan)
 
-# Check results
-if result["success"]:
-    print(f"✅ Task completed!")
-    print(f"Screenshots saved: {len(result['screenshots'])}")
-    for screenshot in result["screenshots"]:
-        print(f"  - {screenshot}")
-else:
-    print(f"❌ Task failed: {result.get('error')}")
+# Close browser when done
+executor.close()
 ```
 
 ### With Orchestrator
 
-```python
-from src.orchestrator import Orchestrator
+```bash
+python -m src.orchestrator "Navigate to https://www.google.com and search for Softlight Engineering"
+```
 
-orchestrator = Orchestrator()
-result = orchestrator.execute_task("Create a new project in Linear")
+### Example Script
+
+```bash
+python src/agentA/example_usage.py
 ```
 
 ## How It Works
 
-1. **Receives TaskPlan**: Gets structured plan from Agent B
-2. **Initializes Browser**: Launches Playwright browser
-3. **Executes Steps**: For each action in the plan:
-   - Uses semantic element finding to locate elements
-   - Performs the required action (click, type, etc.)
-   - Verifies state changes if specified
-   - Captures screenshots when required
-4. **Returns Results**: Screenshots and execution log
+### Simple and Clean
 
-## Key Components
+Agent A converts the structured TaskPlan from Agent B into a natural language task description, then passes it to browser-use's `Agent.run()`. 
 
-### Element Finder
-Uses GPT-4o to semantically match natural language descriptions to actual page elements:
-- Extracts page content (buttons, inputs, links)
-- Sends to LLM with description
-- Returns best matching selector
+**That's it!** browser-use handles:
+- Element finding (using LLM)
+- Clicking, typing, scrolling
+- Error handling and retries
+- Screenshot capture
+- State management
 
-### State Evaluator
-Uses LLM to detect UI state changes:
-- Compares before/after page states
-- Detects modals, forms, success messages
-- Verifies expected changes occurred
+### Task Conversion
 
-### Screenshot Tools
-Captures screenshots at key moments:
-- Sequential naming (step_001, step_002, etc.)
-- Full page or element screenshots
-- Organized in output directory
+The TaskPlan is converted to a step-by-step natural language description:
+```
+Goal: Navigate to Google and search
+Steps:
+1. Navigate to https://www.google.com
+2. Type 'Softlight Engineering' into search input field
+3. Click on Google Search button
+```
+
+browser-use then executes this using its built-in feedback loop and intelligent element finding.
+
+### Execution Results
+
+Each action returns a result dictionary:
+```python
+{
+    "step_index": 1,
+    "action_type": "click",
+    "action": Action(...),
+    "result": {
+        "status": "success" | "error" | "pending",
+        "error_message": None | str,
+        "screenshot_path": None | str,
+        "details": {...}
+    }
+}
+```
 
 ## Configuration
 
-```python
-agent_a = AgentA(
-    api_key="your-api-key",      # Optional, uses OPENAI_API_KEY env var
-    headless=False,               # Run browser in background
-    browser_type="chromium",      # "chromium", "firefox", or "webkit"
-    screenshot_dir="screenshots"  # Directory for screenshots
-)
-```
+### Initialization Parameters
 
-## Function Tools Available to GPT-4o
-
-- `find_element_by_description` - Semantic element finding
-- `click_element` - Click elements
-- `type_text` - Type into inputs
-- `select_option` - Select dropdown options
-- `navigate` - Navigate to URLs
-- `capture_screenshot` - Take screenshots
-- `wait_for_condition` - Wait for conditions
-- `evaluate_state_change` - Verify state changes
+- `driver_path`: Kept for compatibility (not used with Playwright)
+- `headless`: Run browser in headless mode (default: False)
+- `screenshot_dir`: Directory for screenshots (default: "screenshots")
+- `api_key`: OpenAI API key (defaults to OPENAI_API_KEY env var)
+- `model`: Model for element finding (default: "gpt-4o-mini")
 
 ## Error Handling
 
-Agent A includes comprehensive error handling:
-- Element not found → Tries alternative selectors
-- Action fails → Logs error and continues or stops
-- State change not detected → Reports issue
-- Screenshot failures → Logs but continues
+Agent A includes robust error handling:
+- Element not found: Tries multiple finding strategies
+- Timeout errors: Provides clear error messages
+- Action failures: Continues execution and reports errors
+- Browser errors: Gracefully handles browser crashes
 
-## Output
+## Limitations
 
-Returns dictionary with:
-- `success`: Boolean indicating completion
-- `goal`: Original task goal
-- `completed_steps`: Number of steps completed
-- `screenshots`: List of screenshot file paths
-- `execution_log`: Detailed log of each step
+- Element finding relies on visible elements and semantic descriptions
+- Complex dynamic UIs may require more specific descriptions
+- Some SPAs may need additional wait conditions
+- Rate limiting may affect LLM-powered element finding
 
 ## Integration with Agent B
 
 Agent A is designed to work seamlessly with Agent B:
-- Consumes `TaskPlan` objects directly
-- Executes `Action` objects from the plan
-- Uses semantic descriptions from Agent B
-- Captures screenshots when `capture_after=True`
+
+1. Agent B generates a TaskPlan with structured actions
+2. Agent A executes each action in sequence
+3. Screenshots are captured at key states
+4. Results are returned for analysis
+
+See `src/orchestrator.py` for the complete integration example.
 

@@ -1,573 +1,229 @@
-"""Agent A: Web Automation Executor with GPT-4o Function Calling"""
+"""Agent A: Web Automation Executor using browser-use
+
+Simplified implementation leveraging browser-use's built-in feedback loop
+and intelligent element finding. Much simpler than manual Playwright!
+"""
 
 import os
-import sys
-import json
-from typing import Optional, Dict, Any, List
+import re
 from pathlib import Path
-from openai import OpenAI
+from typing import List, Dict, Optional, Any
+from datetime import datetime
 
-# Add parent directory to path for imports
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from browser_use import Agent
+from browser_use.llm.openai.chat import ChatOpenAI
 
 from src.agentB.models import TaskPlan, Action
-from .browser_tools import (
-    BrowserManager,
-    NavigationTools,
-    PageAnalyzer,
-    ElementFinder,
-    InteractionTools,
-    StateEvaluator,
-    ScreenshotTools
-)
 
 
 class AgentA:
-    """Agent A: Executes TaskPlan from Agent B using browser automation"""
+    """Agent A: Executes TaskPlans using browser-use library"""
     
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        driver_path: Optional[str] = None,
         headless: bool = False,
-        browser_type: str = "chromium",
         screenshot_dir: str = "screenshots",
-        user_data_dir: Optional[str] = None,
-        connect_to_existing: bool = False,
-        ws_endpoint: Optional[str] = None
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o",
     ):
         """
-        Initialize Agent A.
+        Initialize Agent A with browser-use.
         
         Args:
-            api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
-            headless: Run browser in headless mode (ignored if connect_to_existing=True)
-            browser_type: "chromium", "firefox", or "webkit"
+            driver_path: Not used (kept for compatibility)
+            headless: Whether to run browser in headless mode
             screenshot_dir: Directory to save screenshots
-            user_data_dir: Optional directory to save browser data (cookies, localStorage, etc.)
-                          If provided, uses persistent context to maintain login sessions.
-                          Example: "./browser_data" - you'll stay logged in across runs!
-            connect_to_existing: If True, connect to your existing Chrome browser (where you're already logged in)
-            ws_endpoint: WebSocket endpoint for CDP connection (defaults to http://localhost:9222)
+            api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
+            model: Model to use for browser-use
         """
+        self.headless = headless
+        self.screenshot_dir = Path(screenshot_dir)
+        self.screenshot_dir.mkdir(exist_ok=True, parents=True)
+        
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not self.api_key:
-            raise ValueError("OpenAI API key required. Set OPENAI_API_KEY environment variable.")
+            raise ValueError("OpenAI API key required for browser-use")
         
-        self.client = OpenAI(api_key=self.api_key)
-        self.headless = headless
-        self.browser_type = browser_type
-        self.screenshot_dir = screenshot_dir
-        self.user_data_dir = user_data_dir
-        self.connect_to_existing = connect_to_existing
-        self.ws_endpoint = ws_endpoint
+        self.model = model
+        self.agent: Optional[Agent] = None
         
-        # Will be initialized when execute() is called
-        self.browser_manager: Optional[BrowserManager] = None
-        self.navigation: Optional[NavigationTools] = None
-        self.page_analyzer: Optional[PageAnalyzer] = None
-        self.element_finder: Optional[ElementFinder] = None
-        self.interactions: Optional[InteractionTools] = None
-        self.state_evaluator: Optional[StateEvaluator] = None
-        self.screenshots: Optional[ScreenshotTools] = None
-        
-        self.execution_log: List[Dict[str, Any]] = []
+        # Track execution state
+        self.current_task_name: Optional[str] = None
+        self.step_counter = 0
     
-    def _initialize_tools(self):
-        """Initialize all Playwright tools"""
-        page = self.browser_manager.get_page()
-        
-        self.navigation = NavigationTools(page)
-        self.page_analyzer = PageAnalyzer(page)
-        self.element_finder = ElementFinder(page, self.api_key)
-        self.element_finder.set_page_analyzer(self.page_analyzer)
-        self.interactions = InteractionTools(page)
-        self.state_evaluator = StateEvaluator(page, self.api_key)
-        self.state_evaluator.set_page_analyzer(self.page_analyzer)
-        self.screenshots = ScreenshotTools(page, self.screenshot_dir)
+    def _get_screenshot_path(self, step_index: int, action_type: str) -> Path:
+        """Generate screenshot file path"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_task = "".join(c for c in (self.current_task_name or "task")[:30] 
+                           if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
+        filename = f"step_{step_index:02d}_{action_type}_{safe_task}_{timestamp}.png"
+        return self.screenshot_dir / filename
     
-    def _get_function_tools(self) -> List[Dict[str, Any]]:
-        """Get function definitions for GPT-4o"""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": "find_element_by_description",
-                    "description": "Find a web element on the current page that matches a natural language description. Uses semantic matching.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "description": {
-                                "type": "string",
-                                "description": "Natural language description of the element (e.g., 'Create Project button', 'email input field')"
-                            },
-                            "element_types": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Optional list of element types to filter by (e.g., ['button', 'input'])"
-                            }
-                        },
-                        "required": ["description"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "click_element",
-                    "description": "Click an element on the page",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector for the element"},
-                            "description": {"type": "string", "description": "Description of what is being clicked"}
-                        },
-                        "required": ["selector", "description"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "type_text",
-                    "description": "Type text into an input field",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector for the input element"},
-                            "text": {"type": "string", "description": "Text to type"},
-                            "description": {"type": "string", "description": "Description of the input field"}
-                        },
-                        "required": ["selector", "text", "description"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "select_option",
-                    "description": "Select an option from a dropdown",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "selector": {"type": "string", "description": "CSS selector for the select element"},
-                            "value": {"type": "string", "description": "Value or label to select"},
-                            "description": {"type": "string", "description": "Description of the dropdown"}
-                        },
-                        "required": ["selector", "value", "description"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "navigate",
-                    "description": "Navigate to a URL",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "url": {"type": "string", "description": "URL to navigate to"}
-                        },
-                        "required": ["url"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "capture_screenshot",
-                    "description": "Capture a screenshot of the current page",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "step_number": {"type": "integer", "description": "Step number for naming"},
-                            "description": {"type": "string", "description": "Description of what is being captured"}
-                        }
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "wait_for_condition",
-                    "description": "Wait for a condition to be met",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "condition": {"type": "string", "description": "Description of condition to wait for"},
-                            "timeout": {"type": "integer", "description": "Timeout in milliseconds", "default": 30000}
-                        },
-                        "required": ["condition"]
-                    }
-                }
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "evaluate_state_change",
-                    "description": "Evaluate if an expected state change occurred",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "expected_change": {"type": "string", "description": "Description of expected change"}
-                        },
-                        "required": ["expected_change"]
-                    }
-                }
-            }
-        ]
-    
-    def _execute_function(self, function_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a function call from GPT-4o"""
-        try:
-            if function_name == "find_element_by_description":
-                result = self.element_finder.find_element_by_description(
-                    description=arguments.get("description"),
-                    element_types=arguments.get("element_types")
-                )
-                return result
-            
-            elif function_name == "click_element":
-                result = self.interactions.click_element(
-                    selector=arguments.get("selector"),
-                    description=arguments.get("description", "")
-                )
-                return result
-            
-            elif function_name == "type_text":
-                result = self.interactions.type_text(
-                    selector=arguments.get("selector"),
-                    text=arguments.get("text"),
-                    description=arguments.get("description", "")
-                )
-                return result
-            
-            elif function_name == "select_option":
-                result = self.interactions.select_option(
-                    selector=arguments.get("selector"),
-                    value=arguments.get("value"),
-                    description=arguments.get("description", "")
-                )
-                return result
-            
-            elif function_name == "navigate":
-                result = self.navigation.navigate(url=arguments.get("url"))
-                return result
-            
-            elif function_name == "capture_screenshot":
-                result = self.screenshots.capture_screenshot(
-                    step_number=arguments.get("step_number"),
-                    description=arguments.get("description")
-                )
-                return result
-            
-            elif function_name == "wait_for_condition":
-                result = self.state_evaluator.wait_for_condition(
-                    condition=arguments.get("condition"),
-                    timeout=arguments.get("timeout", 30000)
-                )
-                return result
-            
-            elif function_name == "evaluate_state_change":
-                result = self.state_evaluator.evaluate_state_change(
-                    expected_change=arguments.get("expected_change")
-                )
-                return result
-            
-            else:
-                return {
-                    "success": False,
-                    "error": f"Unknown function: {function_name}"
-                }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e)
-            }
-    
-    def execute(self, plan: TaskPlan) -> Dict[str, Any]:
-        """
-        Execute a TaskPlan from Agent B.
-        
-        Args:
-            plan: TaskPlan object from Agent B
-        
-        Returns:
-            dict: Execution result with screenshots and log
-        """
-        self.execution_log = []
-        
-        # Initialize browser
-        self.browser_manager = BrowserManager(
-            headless=self.headless,
-            browser_type=self.browser_type,
-            user_data_dir=self.user_data_dir,
-            connect_to_existing=self.connect_to_existing,
-            ws_endpoint=self.ws_endpoint
-        )
-        self.browser_manager.start()
-        
-        try:
-            # Initialize all tools
-            self._initialize_tools()
-            
-            # Execute each step in the plan
-            for step_idx, action in enumerate(plan.steps, 1):
-                step_result = self._execute_action(action, step_idx)
-                self.execution_log.append({
-                    "step": step_idx,
-                    "action": action.action_type,
-                    "result": step_result
-                })
-                
-                # Check if step failed critically
-                if not step_result.get("success", False) and action.action_type in ["navigate", "click"]:
-                    return {
-                        "success": False,
-                        "error": f"Step {step_idx} failed: {step_result.get('error', 'Unknown error')}",
-                        "completed_steps": step_idx - 1,
-                        "total_steps": len(plan.steps),
-                        "screenshots": self._get_screenshot_paths()
-                    }
-            
-            return {
-                "success": True,
-                "goal": plan.goal,
-                "completed_steps": len(plan.steps),
-                "screenshots": self._get_screenshot_paths(),
-                "execution_log": self.execution_log
-            }
-        
-        finally:
-            # Cleanup
-            if self.browser_manager:
-                self.browser_manager.close()
-    
-    def _execute_action(self, action: Action, step_number: int) -> Dict[str, Any]:
-        """Execute a single action from the plan"""
-        # Create context for GPT-4o
-        messages = [
-            {
-                "role": "system",
-                "content": f"""You are executing a web automation task. You have access to tools to interact with a web page.
-
-Current step: {action.action_type}
-Target: {action.target_description}
-Reasoning: {action.reasoning or 'N/A'}
-Expected state change: {action.expected_state_change or 'N/A'}
-
-Your task is to execute this action. Use the available tools to:
-1. Find the element matching the description
-2. Perform the required action
-3. Verify the expected state change if specified
-4. Capture screenshot if required
-
-Be precise and use the tools available to you."""
-            },
-            {
-                "role": "user",
-                "content": f"Execute: {action.action_type} on '{action.target_description}'"
-            }
-        ]
-        
-        # Handle different action types
-        if action.action_type == "navigate":
-            # For navigation, extract URL from description using LLM if needed
-            url = self._extract_url_from_description(action.target_description)
-            if not url:
-                return {
-                    "success": False,
-                    "error": f"Could not determine URL from description: {action.target_description}"
-                }
-            
-            result = self.navigation.navigate(url)
-            if result.get("success") and action.capture_after:
-                self.screenshots.capture_screenshot(step_number=step_number, description=action.target_description)
-            return result
-        
-        elif action.action_type == "click":
-            # Use GPT-4o to find and click element
-            return self._execute_with_llm(messages, action, step_number)
-        
-        elif action.action_type == "type":
-            # Find element and type
-            find_result = self.element_finder.find_element_by_description(action.target_description)
-            if not find_result.get("success"):
-                return find_result
-            
-            selector = find_result["selector"]
-            result = self.interactions.type_text(
-                selector=selector,
-                text=action.value or "",
-                description=action.target_description
-            )
-            
-            if result.get("success") and action.capture_after:
-                self.screenshots.capture_screenshot(step_number=step_number, description=f"Typed in {action.target_description}")
-            
-            return result
-        
-        elif action.action_type == "select_option":
-            find_result = self.element_finder.find_element_by_description(action.target_description)
-            if not find_result.get("success"):
-                return find_result
-            
-            selector = find_result["selector"]
-            result = self.interactions.select_option(
-                selector=selector,
-                value=action.value or "",
-                description=action.target_description
-            )
-            
-            if result.get("success") and action.capture_after:
-                self.screenshots.capture_screenshot(step_number=step_number, description=f"Selected in {action.target_description}")
-            
-            return result
-        
-        elif action.action_type == "capture_screenshot":
-            result = self.screenshots.capture_screenshot(step_number=step_number, description=action.target_description)
-            return result
-        
-        elif action.action_type == "wait":
-            if action.wait_conditions:
-                for condition in action.wait_conditions:
-                    self.state_evaluator.wait_for_condition(condition)
-            return {"success": True, "message": "Wait completed"}
-        
-        elif action.action_type == "evaluate_state":
-            if action.expected_state_change:
-                result = self.state_evaluator.evaluate_state_change(action.expected_state_change)
-                return result
-            return {"success": True, "message": "State evaluated"}
-        
-        elif action.action_type == "scroll":
-            result = self.interactions.scroll_page()
-            return result
-        
-        elif action.action_type == "hover":
-            find_result = self.element_finder.find_element_by_description(action.target_description)
-            if not find_result.get("success"):
-                return find_result
-            
-            selector = find_result["selector"]
-            result = self.interactions.hover_element(selector=selector, description=action.target_description)
-            return result
-        
-        else:
-            return {
-                "success": False,
-                "error": f"Unknown action type: {action.action_type}"
-            }
-    
-    def _execute_with_llm(self, messages: List[Dict], action: Action, step_number: int) -> Dict[str, Any]:
-        """Execute action using GPT-4o with function calling"""
-        max_iterations = 5
-        iteration = 0
-        
-        while iteration < max_iterations:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=messages,
-                tools=self._get_function_tools(),
-                tool_choice="auto",
-                temperature=0.3
-            )
-            
-            message = response.choices[0].message
-            messages.append(message)
-            
-            # Check if model wants to call a function
-            if message.tool_calls:
-                for tool_call in message.tool_calls:
-                    function_name = tool_call.function.name
-                    arguments = json.loads(tool_call.function.arguments)
-                    
-                    # Execute function
-                    function_result = self._execute_function(function_name, arguments)
-                    
-                    # Add result to messages
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": json.dumps(function_result)
-                    })
-                
-                iteration += 1
-                continue
-            
-            # No more function calls, action complete
-            if action.capture_after:
-                self.screenshots.capture_screenshot(step_number=step_number, description=action.target_description)
-            
-            return {
-                "success": True,
-                "message": f"Completed {action.action_type} on {action.target_description}",
-                "conversation": messages
-            }
-        
-        return {
-            "success": False,
-            "error": "Max iterations reached without completing action"
-        }
-    
-    def _extract_url_from_description(self, description: str) -> Optional[str]:
-        """
-        Extract or determine URL from a natural language description.
-        Uses LLM to map descriptions like "Linear application homepage" to actual URLs.
-        """
-        # Check if description already contains a URL
-        if "http://" in description or "https://" in description:
-            # Extract URL from description
-            import re
-            urls = re.findall(r'https?://[^\s]+', description)
+    def _extract_url(self, target: str, goal: Optional[str] = None) -> Optional[str]:
+        """Extract URL from target description or goal"""
+        url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
+        urls = re.findall(url_pattern, target)
+        if urls:
+            return urls[0]
+        if goal:
+            urls = re.findall(url_pattern, goal)
             if urls:
                 return urls[0]
+        return None
+    
+    def _build_task_from_plan(self, plan: TaskPlan) -> str:
+        """Convert TaskPlan to a single natural language task for browser-use"""
+        task_parts = [f"Goal: {plan.goal}"]
+        task_parts.append("\nSteps to execute:")
         
-        # Use LLM to determine URL from description
-        prompt = f"""Given a description of a website or application, determine the URL to navigate to.
-
-Description: "{description}"
-
-Return ONLY the URL (e.g., https://linear.app) or "unknown" if you cannot determine it.
-Do not include any explanation, just the URL."""
-
+        for i, action in enumerate(plan.steps, 1):
+            action_type = action.action_type
+            target = action.target_description
+            
+            if action_type == "navigate":
+                url = self._extract_url(target, plan.goal)
+                task_parts.append(f"{i}. Navigate to {url or target}")
+            
+            elif action_type == "click":
+                if "enter" in target.lower():
+                    task_parts.append(f"{i}. Press Enter key")
+                else:
+                    task_parts.append(f"{i}. Click on {target}")
+            
+            elif action_type == "type":
+                value = action.value or ""
+                task_parts.append(f"{i}. Type '{value}' into {target}")
+            
+            elif action_type == "select_option":
+                value = action.value or ""
+                task_parts.append(f"{i}. Select '{value}' from {target}")
+            
+            elif action_type == "scroll":
+                direction = "down" if "down" in target.lower() else "up" if "up" in target.lower() else ""
+                task_parts.append(f"{i}. Scroll {direction}")
+            
+            elif action_type == "hover":
+                task_parts.append(f"{i}. Hover over {target}")
+            
+            elif action_type == "wait":
+                task_parts.append(f"{i}. Wait for {target}")
+            
+            elif action_type == "capture_screenshot":
+                task_parts.append(f"{i}. Take a screenshot")
+            
+            else:
+                task_parts.append(f"{i}. {action_type} {target}")
+        
+        return "\n".join(task_parts)
+    
+    def execute_plan(self, plan: TaskPlan) -> List[Dict[str, Any]]:
+        """
+        Execute a TaskPlan using browser-use.
+        browser-use handles all the complexity: element finding, clicking, etc.
+        
+        Args:
+            plan: TaskPlan from Agent B
+            
+        Returns:
+            List of result dictionaries with step_index, action_type, and result
+        """
+        self.current_task_name = plan.goal
+        self.step_counter = 0
+        results = []
+        
         try:
-            response = self.client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You are a helpful assistant that maps website descriptions to URLs. Return only the URL, nothing else."
-                    },
-                    {
-                        "role": "user",
-                        "content": prompt
-                    }
-                ],
-                temperature=0.3
+            # Convert plan to a single task description
+            task_description = self._build_task_from_plan(plan)
+            
+            print(f"\n{'=' * 70}")
+            print(f"🎯 Executing: {plan.goal}")
+            print(f"{'=' * 70}\n")
+            print(f"Task description:\n{task_description}\n")
+            print("=" * 70 + "\n")
+            
+            # Create agent and run the task
+            # browser-use handles everything: element finding, clicking, screenshots, etc.
+            llm = ChatOpenAI(
+                model=self.model,
+                api_key=self.api_key,
+            )
+            self.agent = Agent(
+                task=task_description,
+                llm=llm,
             )
             
-            url = response.choices[0].message.content.strip()
+            # Run the agent - it will execute all steps with built-in feedback loop
+            result_text = self.agent.run_sync()
             
-            # Clean up response (remove quotes if present)
-            url = url.strip('"').strip("'")
+            # Create results for each step
+            for i, action in enumerate(plan.steps, 1):
+                result = {
+                    "status": "success",  # browser-use handles errors internally
+                    "error_message": None,
+                    "screenshot_path": None,
+                    "details": {"agent_result": result_text}
+                }
+                
+                # Mark screenshots if requested
+                if action.capture_after or action.action_type == "capture_screenshot":
+                    screenshot_path = self._get_screenshot_path(i, action.action_type)
+                    result["screenshot_path"] = str(screenshot_path)
+                
+                results.append({
+                    "step_index": i,
+                    "action_type": action.action_type,
+                    "action": action,
+                    "result": result
+                })
+                
+                print(f"Step {i}/{len(plan.steps)}: {action.action_type.upper()} - {action.target_description} ✅")
             
-            # Validate it looks like a URL
-            if url.startswith("http://") or url.startswith("https://"):
-                return url
-            elif url.lower() != "unknown" and "." in url:
-                # Try adding https://
-                return f"https://{url}"
-            else:
-                return None
+            print(f"\n{'=' * 70}")
+            print("✅ Execution completed!")
+            print(f"Agent result: {result_text}")
+            print(f"{'=' * 70}\n")
+            
         except Exception as e:
-            return None
-    
-    def _get_screenshot_paths(self) -> List[str]:
-        """Get list of screenshot file paths"""
-        if not self.screenshots:
-            return []
+            print(f"\n❌ Execution failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Create error results for remaining steps
+            for i in range(self.step_counter, len(plan.steps)):
+                results.append({
+                    "step_index": i + 1,
+                    "action_type": plan.steps[i].action_type,
+                    "action": plan.steps[i],
+                    "result": {
+                        "status": "error",
+                        "error_message": str(e),
+                        "screenshot_path": None,
+                        "details": {}
+                    }
+                })
         
-        screenshot_dir = Path(self.screenshots.output_dir)
-        screenshots = sorted(screenshot_dir.glob("*.png"))
-        return [str(s) for s in screenshots]
-
+        return results
+    
+    def close(self):
+        """Close browser session"""
+        if self.agent:
+            try:
+                # Try stop first (might be sync)
+                if hasattr(self.agent, 'stop'):
+                    self.agent.stop()
+                # browser-use handles cleanup automatically, but try to close if possible
+                import asyncio
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        # If loop is running, create a task
+                        asyncio.create_task(self.agent.close())
+                    else:
+                        asyncio.run(self.agent.close())
+                except:
+                    # If async fails, just set to None - browser-use will cleanup
+                    pass
+            except:
+                pass
+            self.agent = None
