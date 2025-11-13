@@ -16,10 +16,16 @@ from datetime import datetime
 
 from browser_use import Agent, Browser
 try:
-    # Prefer top-level import when available
-    from browser_use import ChatOpenAI  # type: ignore
+    # Try to import ChatBrowserUse first
+    from browser_use import ChatBrowserUse  # type: ignore
+    CHAT_BROWSER_USE_AVAILABLE = True
 except Exception:
-    from browser_use.llm.openai.chat import ChatOpenAI
+    CHAT_BROWSER_USE_AVAILABLE = False
+    try:
+        # Fallback to ChatOpenAI
+        from browser_use import ChatOpenAI  # type: ignore
+    except Exception:
+        from browser_use.llm.openai.chat import ChatOpenAI
 
 from src.agentB.models import TaskPlan, Action
 
@@ -51,7 +57,9 @@ class AgentA:
             headless: Whether to run browser in headless mode
             screenshot_dir: Directory to save screenshots
             api_key: OpenAI API key (defaults to OPENAI_API_KEY env var)
-            model: Model to use for browser-use
+            model: Model to use. If ChatBrowserUse is available, accepts 'bu-latest' or 'bu-1-0' 
+                   (GPT model names like 'gpt-4o' will be converted to 'bu-latest').
+                   If ChatOpenAI is used, accepts GPT model names like 'gpt-4o', 'gpt-4', etc.
             use_real_browser: Whether to connect to existing Chrome profile via CDP
             browser_type: Browser to control via CDP. Supported: "chrome" (default), "brave".
             executable_path: Path to Chrome executable (auto-detected by platform if not set)
@@ -62,11 +70,34 @@ class AgentA:
         self.screenshot_dir = Path(screenshot_dir)
         self.screenshot_dir.mkdir(exist_ok=True, parents=True)
         
-        self.api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not self.api_key:
-            raise ValueError("OpenAI API key required for browser-use")
+        # ChatBrowserUse uses BROWSER_USE_API_KEY, ChatOpenAI uses OPENAI_API_KEY
+        if CHAT_BROWSER_USE_AVAILABLE:
+            # ChatBrowserUse needs BROWSER_USE_API_KEY
+            self.api_key = api_key or os.getenv("BROWSER_USE_API_KEY")
+            if not self.api_key:
+                raise ValueError(
+                    "BROWSER_USE_API_KEY required for ChatBrowserUse. "
+                    "Set BROWSER_USE_API_KEY environment variable or pass api_key parameter. "
+                    "Get your API key at https://cloud.browser-use.com/new-api-key"
+                )
+            # ChatBrowserUse models: 'bu-latest' or 'bu-1-0'
+            if model.startswith("gpt-"):
+                # Default to bu-latest for GPT models when using ChatBrowserUse
+                self.model = "bu-latest"
+            elif model in ["bu-latest", "bu-1-0"]:
+                self.model = model
+            else:
+                raise ValueError(f"Invalid model for ChatBrowserUse: '{model}'. Must be 'bu-latest' or 'bu-1-0', or a GPT model name (will be converted to 'bu-latest')")
+        else:
+            # ChatOpenAI needs OPENAI_API_KEY
+            self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+            if not self.api_key:
+                raise ValueError("OpenAI API key required for browser-use. Set OPENAI_API_KEY environment variable or pass api_key parameter.")
+            # For ChatOpenAI, only GPT models are allowed
+            if not model.startswith("gpt-"):
+                raise ValueError(f"Only GPT models are supported with ChatOpenAI. Got: {model}. Use 'gpt-4o', 'gpt-4', etc.")
+            self.model = model
         
-        self.model = model
         self.agent: Optional[Agent] = None
 
         # Real browser configuration
@@ -243,6 +274,379 @@ class AgentA:
         filename = f"step_{step_index:02d}_{action_type}_{safe_task}_{timestamp}.png"
         return self.screenshot_dir / filename
     
+    def initialize_browser(self):
+        """Initialize the browser agent if not already initialized"""
+        if self.agent:
+            return
+        
+        # Use ChatBrowserUse if available, otherwise ChatOpenAI
+        if CHAT_BROWSER_USE_AVAILABLE:
+            # ChatBrowserUse uses 'bu-latest' or 'bu-1-0' models
+            llm = ChatBrowserUse(
+                model=self.model,  # Already converted to bu-latest or bu-1-0 in __init__
+                api_key=self.api_key,
+            )
+        else:
+            # ChatOpenAI uses GPT model names
+            llm = ChatOpenAI(
+                model=self.model,  # GPT model name (gpt-4o, gpt-4, etc.)
+                api_key=self.api_key,
+            )
+        
+        if self.use_real_browser and self.browser:
+            browser_label = "Chrome" if self.browser_type == "chrome" else "Brave"
+            print(f"🔗 Connecting to existing {browser_label} browser...")
+            try:
+                if self.cdp_url:
+                    print(f"   CDP URL: {self.cdp_url}")
+                print(f"   Executable: {self.executable_path}")
+                print(f"   Profile: {self.profile_directory}")
+                print(f"   User data dir: {self.user_data_dir}")
+            except Exception:
+                pass
+            if not self.cdp_url:
+                print(f"   ⚠️  Make sure {self.browser_type.title()} is fully closed before running!")
+            if getattr(self, "_profile_lock_detected", False):
+                print(f"   ⚠️  Detected {self.browser_type.title()} profile lock markers. "
+                      f"If connection times out, quit {self.browser_type.title()} (Cmd+Q) and retry.")
+            self.agent = Agent(
+                task="",  # Will be set per action
+                browser=self.browser,
+                llm=llm,
+            )
+        else:
+            self.agent = Agent(
+                task="",  # Will be set per action
+                llm=llm,
+                headless=self.headless,
+            )
+    
+    def _action_to_description(self, action: Action) -> str:
+        """Convert a single Action to natural language description"""
+        action_type = action.action_type
+        target = action.target_description
+        
+        if action_type == "navigate":
+            url = self._extract_url(target, target)
+            return f"Navigate to {url or target}"
+        elif action_type == "click":
+            if "enter" in target.lower():
+                return "Press Enter key"
+            else:
+                return f"Click on {target}"
+        elif action_type == "type":
+            value = action.value or ""
+            return f"Type '{value}' into {target}"
+        elif action_type == "select_option":
+            value = action.value or ""
+            return f"Select '{value}' from {target}"
+        elif action_type == "scroll":
+            direction = "down" if "down" in target.lower() else "up" if "up" in target.lower() else ""
+            return f"Scroll {direction}"
+        elif action_type == "wait":
+            return f"Wait for {target}"
+        elif action_type == "capture_screenshot":
+            # Screenshot capture is handled separately, not as a browser-use action
+            # Return a no-op action that just waits briefly
+            return "Wait briefly for the page to stabilize"
+        elif action_type == "hover":
+            return f"Hover over {target}"
+        elif action_type == "evaluate_state":
+            return f"Evaluate if the task is complete. Check: {target}"
+        else:
+            return f"{action_type} {target}"
+    
+    def execute_single_action(
+        self,
+        action: Action,
+        step_index: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Execute a simple task based on action and return the result with screenshot.
+        Each action becomes a complete simple task for browser-use.
+        This avoids browser-use's history/state issues by treating each action as a fresh task.
+        
+        Args:
+            action: Action to execute
+            step_index: Step number for tracking
+            
+        Returns:
+            Dictionary with step_index, action, result (including screenshot_path)
+        """
+        # Handle capture_screenshot action type specially - don't execute via browser-use
+        if action.action_type == "capture_screenshot":
+            screenshot_path = self.capture_current_screenshot(step_index, action.action_type)
+            return {
+                "step_index": step_index,
+                "action_type": action.action_type,
+                "action": action,
+                "result": {
+                    "status": "success",
+                    "error_message": None,
+                    "screenshot_path": str(screenshot_path) if screenshot_path else None,
+                    "details": {"agent_result": "Screenshot captured successfully"}
+                }
+            }
+        
+        # Convert action to a simple, complete task for browser-use
+        task_text = self._action_to_simple_task(action)
+        
+        try:
+            # Create LLM
+            if CHAT_BROWSER_USE_AVAILABLE:
+                llm = ChatBrowserUse(
+                    model=self.model,
+                    api_key=self.api_key,
+                )
+            else:
+                llm = ChatOpenAI(
+                    model=self.model,
+                    api_key=self.api_key,
+                )
+            
+            # Reuse browser if available, otherwise create new one
+            browser_to_use = None
+            
+            # For CDP connections, always recreate the Browser object to ensure
+            # fresh handlers are initialized (browser-use clears state after run_sync)
+            if self.use_real_browser and self.cdp_url and self._is_cdp_reachable(self.cdp_url):
+                # Recreate Browser connection to ensure fresh handlers
+                # The underlying browser process stays the same, so state is maintained
+                try:
+                    browser_to_use = Browser(
+                        cdp_url=self.cdp_url,
+                        user_data_dir=self.user_data_dir,
+                        profile_directory=self.profile_directory,
+                    )
+                    self.browser = browser_to_use
+                except Exception as e:
+                    print(f"   ⚠️  Failed to recreate browser connection: {e}")
+                    # Fallback to existing browser if available
+                    if self.browser:
+                        browser_to_use = self.browser
+            elif self.use_real_browser and self.browser:
+                # Use existing browser if CDP URL not available
+                browser_to_use = self.browser
+            elif self.agent and hasattr(self.agent, 'browser') and self.agent.browser:
+                browser_to_use = self.agent.browser
+                # Update self.browser for consistency
+                self.browser = browser_to_use
+            
+            # Create agent with simple task
+            if browser_to_use:
+                # Small delay to ensure browser connection is ready
+                time.sleep(0.1)
+                temp_agent = Agent(
+                    task=task_text,
+                    browser=browser_to_use,
+                    llm=llm,
+                )
+            else:
+                # Create new browser if needed
+                temp_agent = Agent(
+                    task=task_text,
+                    llm=llm,
+                    headless=self.headless,
+                )
+                # Update self.browser for future reuse
+                if hasattr(temp_agent, 'browser') and temp_agent.browser:
+                    self.browser = temp_agent.browser
+            
+            # Execute the complete simple task
+            result_text: Optional[str] = None
+            status = "success"
+            error_message = None
+            
+            try:
+                result_text = temp_agent.run_sync()
+                # Small delay to let browser state stabilize
+                time.sleep(0.5)
+                
+                # Convert result_text to string safely
+                if result_text is not None:
+                    if not isinstance(result_text, str):
+                        result_text = str(result_text)
+            except Exception as e:
+                error_message = str(e)
+                result_text = f"Error: {error_message}"
+                status = "error"
+                print(f"   ⚠️  Task execution had issues: {e}")
+            
+            # Update browser reference for future reuse
+            # Note: We don't keep the agent reference since browser-use clears
+            # session state after run_sync(), and we'll recreate the Browser connection
+            # for the next action anyway
+            if hasattr(temp_agent, 'browser') and temp_agent.browser:
+                # Only update browser if we're not using CDP (managed browser)
+                if not (self.use_real_browser and self.cdp_url):
+                    self.browser = temp_agent.browser
+            # Clear agent reference to force fresh connection next time
+            self.agent = None
+            
+            # Always capture screenshot after action execution
+            screenshot_path = None
+            try:
+                # Small delay before screenshot to ensure page is stable
+                time.sleep(0.3)
+                screenshot_path = self.capture_current_screenshot(step_index, action.action_type)
+            except Exception as e:
+                print(f"   ⚠️  Could not capture screenshot: {e}")
+            
+            result = {
+                "status": status,
+                "error_message": error_message,
+                "screenshot_path": str(screenshot_path) if screenshot_path else None,
+                "details": {"agent_result": result_text if result_text else "Completed"}
+            }
+            
+            return {
+                "step_index": step_index,
+                "action_type": action.action_type,
+                "action": action,
+                "result": result
+            }
+            
+        except Exception as e:
+            # Capture screenshot even on error
+            screenshot_path = None
+            try:
+                screenshot_path = self.capture_current_screenshot(step_index, action.action_type)
+            except:
+                pass
+            
+            return {
+                "step_index": step_index,
+                "action_type": action.action_type,
+                "action": action,
+                "result": {
+                    "status": "error",
+                    "error_message": str(e),
+                    "screenshot_path": str(screenshot_path) if screenshot_path else None,
+                    "details": {}
+                }
+            }
+    
+    def _action_to_simple_task(self, action: Action) -> str:
+        """Convert an Action to a simple, complete task description for browser-use"""
+        action_type = action.action_type
+        target = action.target_description
+        
+        if action_type == "navigate":
+            url = self._extract_url(target, target)
+            if url:
+                return f"Navigate to {url}"
+            else:
+                # Extract app name or use target as-is
+                if "linear" in target.lower():
+                    return "Navigate to https://linear.app"
+                elif "notion" in target.lower():
+                    return "Navigate to https://www.notion.so"
+                else:
+                    return f"Navigate to {target}"
+        elif action_type == "click":
+            if "enter" in target.lower():
+                return "Press the Enter key"
+            else:
+                return f"Click on {target}"
+        elif action_type == "type":
+            value = action.value or ""
+            return f"Type '{value}' into {target}"
+        elif action_type == "select_option":
+            value = action.value or ""
+            return f"Select '{value}' from {target}"
+        elif action_type == "scroll":
+            direction = "down" if "down" in target.lower() else "up" if "up" in target.lower() else "down"
+            return f"Scroll {direction} on the page"
+        elif action_type == "wait":
+            return f"Wait for {target} to appear"
+        elif action_type == "hover":
+            return f"Hover over {target}"
+        elif action_type == "evaluate_state":
+            return f"Check if {target}. Evaluate the current state of the page."
+        else:
+            return f"{action_type} {target}"
+    
+    def capture_current_screenshot(self, step_index: int, action_type: str) -> Optional[str]:
+        """Capture a screenshot of the current browser state"""
+        screenshot_path = self._get_screenshot_path(step_index, action_type)
+        try:
+            # Try multiple ways to access the Playwright page
+            page = None
+            
+            # Method 1: Try to access browser-use's underlying browser/page
+            if self.agent and hasattr(self.agent, 'browser'):
+                browser_obj = self.agent.browser
+                if browser_obj:
+                    # Try different attribute names browser-use might use
+                    if hasattr(browser_obj, 'page'):
+                        page = browser_obj.page
+                    elif hasattr(browser_obj, '_page'):
+                        page = browser_obj._page
+                    elif hasattr(browser_obj, 'context') and hasattr(browser_obj.context, 'pages'):
+                        pages = browser_obj.context.pages
+                        if pages:
+                            page = pages[0]
+            
+            # Method 2: Try to access via browser attribute
+            if not page and self.browser:
+                if hasattr(self.browser, 'page'):
+                    page = self.browser.page
+                elif hasattr(self.browser, '_page'):
+                    page = self.browser._page
+                elif hasattr(self.browser, 'context') and hasattr(self.browser.context, 'pages'):
+                    pages = self.browser.context.pages
+                    if pages:
+                        page = pages[0]
+            
+            # Method 3: Try to get page from browser-use's internal state
+            if not page and self.agent:
+                # browser-use might store page in different places
+                for attr in ['_browser', 'browser', '_context']:
+                    if hasattr(self.agent, attr):
+                        obj = getattr(self.agent, attr)
+                        if obj and hasattr(obj, 'page'):
+                            page = obj.page
+                            break
+                        elif obj and hasattr(obj, 'context') and hasattr(obj.context, 'pages'):
+                            pages = obj.context.pages
+                            if pages:
+                                page = pages[0]
+                                break
+            
+            if page:
+                page.screenshot(path=str(screenshot_path))
+                print(f"   📸 Screenshot captured: {screenshot_path}")
+                return str(screenshot_path)
+            else:
+                print(f"   ⚠️  Warning: Could not access browser page to capture screenshot")
+                return None
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not capture screenshot: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def get_current_url(self) -> Optional[str]:
+        """Get the current page URL"""
+        try:
+            # Try to access browser-use's underlying browser/page
+            if self.agent and hasattr(self.agent, 'browser'):
+                browser_obj = self.agent.browser
+                if browser_obj and hasattr(browser_obj, 'page'):
+                    page = browser_obj.page
+                    if page:
+                        return page.url
+            
+            # Fallback: try to access via browser attribute
+            if self.browser and hasattr(self.browser, 'page'):
+                page = self.browser.page
+                if page:
+                    return page.url
+            
+            return None
+        except Exception:
+            return None
+    
     def _extract_url(self, target: str, goal: Optional[str] = None) -> Optional[str]:
         """Extract URL from target description or goal"""
         url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
@@ -327,10 +731,17 @@ class AgentA:
             
             # Create agent and run the task
             # If real browser configured, attach to Chrome via CDP; else use managed browser
-            llm = ChatOpenAI(
-                model=self.model,
-                api_key=self.api_key,
-            )
+            # Use ChatBrowserUse if available, otherwise ChatOpenAI (GPT models only)
+            if CHAT_BROWSER_USE_AVAILABLE:
+                llm = ChatBrowserUse(
+                    model=self.model,
+                    api_key=self.api_key,
+                )
+            else:
+                llm = ChatOpenAI(
+                    model=self.model,
+                    api_key=self.api_key,
+                )
             if self.use_real_browser and self.browser:
                 browser_label = "Chrome" if self.browser_type == "chrome" else "Brave"
                 print(f"🔗 Connecting to existing {browser_label} browser...")

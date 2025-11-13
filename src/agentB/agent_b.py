@@ -6,7 +6,8 @@ executable plans for web automation tasks.
 
 import json
 import os
-from typing import Optional
+import base64
+from typing import Optional, List, Dict
 from openai import OpenAI
 from pydantic import ValidationError
 
@@ -212,4 +213,194 @@ Please generate a refined plan following the same structure. Address the feedbac
             return self._generate_plan(refinement_prompt, self.model)
         except Exception as e:
             raise ValueError(f"Failed to refine plan: {e}")
+    
+    def decide_next_action(
+        self,
+        task: str,
+        screenshot_path: Optional[str] = None,
+        execution_history: Optional[List[Dict]] = None,
+        current_url: Optional[str] = None,
+    ) -> Action:
+        """
+        Decide the next action based on current UI state (screenshot).
+        This enables real-time adaptive planning.
+        
+        Args:
+            task: The original task description
+            screenshot_path: Path to current screenshot
+            execution_history: List of previous actions and results
+            current_url: Current page URL
+            
+        Returns:
+            Action: Next action to execute
+        """
+        execution_history = execution_history or []
+        
+        # Build context from execution history
+        history_text = ""
+        if execution_history:
+            history_text = "\n\nEXECUTION HISTORY:\n"
+            for i, step in enumerate(execution_history, 1):
+                action = step.get("action", {})
+                result = step.get("result", {})
+                if isinstance(action, dict):
+                    action_type = action.get("action_type", "unknown")
+                    target = action.get("target_description", "")
+                else:
+                    action_type = getattr(action, "action_type", "unknown")
+                    target = getattr(action, "target_description", "")
+                
+                history_text += f"{i}. {action_type}: {target}\n"
+                history_text += f"   Status: {result.get('status', 'unknown')}\n"
+                if result.get('error_message'):
+                    history_text += f"   Error: {result.get('error_message')}\n"
+        
+        # Create prompt for vision-based decision making
+        prompt = f"""You are an intelligent web automation agent that analyzes UI states and decides the next action.
+
+ORIGINAL TASK: {task}
+
+CURRENT STATE:
+- URL: {current_url or "Unknown"}
+- Screenshot available: {"Yes" if screenshot_path else "No"}
+{history_text}
+
+Your job is to analyze the current UI state and decide the SINGLE next action to take.
+
+AVAILABLE ACTIONS:
+- navigate: Navigate to a URL
+- click: Click a button, link, or interactive element
+- type: Type text into an input field
+- select_option: Select an option from a dropdown
+- scroll: Scroll the page (up/down)
+- wait: Wait for an element or condition
+- capture_screenshot: Take a screenshot of current state
+- hover: Hover over an element
+- evaluate_state: Evaluate if task is complete
+
+IMPORTANT:
+1. Look at the screenshot (if provided) to understand the current UI state
+2. Consider what has been done so far (execution history)
+3. Decide the ONE next action that moves toward completing the task
+4. If a modal/form appears, interact with it
+5. If the task appears complete, use evaluate_state
+6. Always capture screenshots after significant state changes (modals, forms, success messages)
+
+OUTPUT FORMAT (JSON only):
+{{
+    "action_type": "navigate|click|type|wait|capture_screenshot|evaluate_state|scroll|select_option|hover",
+    "target_description": "Natural language description of what to interact with",
+    "value": "Optional value for type/select_option actions",
+    "expected_state_change": "What should happen after this action",
+    "capture_after": true/false,
+    "reasoning": "Why this action is needed based on current UI state",
+    "wait_conditions": ["condition1", "condition2"]
+}}
+
+Think step by step:
+1. What does the current screenshot show?
+2. What has been done so far?
+3. What is the next logical step to complete the task?
+4. What UI element needs to be interacted with?
+
+Now decide the next action:"""
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert web automation agent. Analyze UI screenshots and decide the next action. Always respond with valid JSON only, no additional text."
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+        
+        # Add screenshot if available (for vision models)
+        if screenshot_path and os.path.exists(screenshot_path):
+            try:
+                with open(screenshot_path, "rb") as image_file:
+                    image_data = base64.b64encode(image_file.read()).decode('utf-8')
+                
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_data}"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "This is the current UI state. Analyze it and decide the next action."
+                        }
+                    ]
+                })
+            except Exception as e:
+                # If screenshot can't be read, continue without it
+                pass
+        
+        try:
+            # Use vision-capable model (gpt-4o supports vision)
+            vision_model = "gpt-4o" if screenshot_path else self.model
+            
+            response = self.client.chat.completions.create(
+                model=vision_model,
+                messages=messages,
+                temperature=self.temperature,
+                response_format={"type": "json_object"},
+            )
+            
+            content = response.choices[0].message.content
+            if content:
+                # Clean up response
+                content = content.strip()
+                if content.startswith("```json"):
+                    content = content[7:]
+                if content.startswith("```"):
+                    content = content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+                content = content.strip()
+                
+                action_data = json.loads(content)
+                return Action(**action_data)
+            else:
+                raise ValueError("Empty response from model")
+                
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Failed to parse JSON response: {e}")
+        except ValidationError as e:
+            raise ValueError(f"Action validation failed: {e}")
+        except Exception as e:
+            raise ValueError(f"Model API error: {e}")
+    
+    def is_task_complete(
+        self,
+        task: str,
+        screenshot_path: Optional[str] = None,
+        execution_history: Optional[List[Dict]] = None,
+    ) -> bool:
+        """
+        Determine if the task has been completed based on current state.
+        
+        Args:
+            task: Original task description
+            screenshot_path: Path to current screenshot
+            execution_history: List of previous actions
+            
+        Returns:
+            bool: True if task appears complete
+        """
+        # Use decide_next_action to check completion
+        try:
+            next_action = self.decide_next_action(
+                task=task,
+                screenshot_path=screenshot_path,
+                execution_history=execution_history,
+            )
+            return next_action.action_type == "evaluate_state"
+        except Exception:
+            return False
 
