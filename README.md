@@ -1,5 +1,3 @@
-# Intelligent Web Automation System
-
 A two-agent system for intelligent web automation that captures UI states in real-time. Agent B (planner) analyzes screenshots and decides actions, while Agent A (executor) performs browser automation. Screenshots are captured independently using Playwright CDP.
 
 ## 🏗️ Architecture
