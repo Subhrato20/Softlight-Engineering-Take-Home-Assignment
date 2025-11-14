@@ -477,25 +477,16 @@ class AgentA:
             # session state after run_sync(), and we'll recreate the Browser connection
             # for the next action anyway
             if hasattr(temp_agent, 'browser') and temp_agent.browser:
-                # Only update browser if we're not using CDP (managed browser)
-                if not (self.use_real_browser and self.cdp_url):
-                    self.browser = temp_agent.browser
+                # Store browser reference - this is what we'll use for screenshots
+                self.browser = temp_agent.browser
             # Clear agent reference to force fresh connection next time
             self.agent = None
             
-            # Always capture screenshot after action execution
-            screenshot_path = None
-            try:
-                # Small delay before screenshot to ensure page is stable
-                time.sleep(0.3)
-                screenshot_path = self.capture_current_screenshot(step_index, action.action_type)
-            except Exception as e:
-                print(f"   ⚠️  Could not capture screenshot: {e}")
-            
+            # Don't capture screenshot here - orchestrator will do it after step completes
             result = {
                 "status": status,
                 "error_message": error_message,
-                "screenshot_path": str(screenshot_path) if screenshot_path else None,
+                "screenshot_path": None,  # Will be set by orchestrator
                 "details": {"agent_result": result_text if result_text else "Completed"}
             }
             
@@ -507,13 +498,7 @@ class AgentA:
             }
             
         except Exception as e:
-            # Capture screenshot even on error
-            screenshot_path = None
-            try:
-                screenshot_path = self.capture_current_screenshot(step_index, action.action_type)
-            except:
-                pass
-            
+            # Don't capture screenshot here - orchestrator will handle it
             return {
                 "step_index": step_index,
                 "action_type": action.action_type,
@@ -521,7 +506,7 @@ class AgentA:
                 "result": {
                     "status": "error",
                     "error_message": str(e),
-                    "screenshot_path": str(screenshot_path) if screenshot_path else None,
+                    "screenshot_path": None,  # Will be set by orchestrator
                     "details": {}
                 }
             }
@@ -566,65 +551,43 @@ class AgentA:
         else:
             return f"{action_type} {target}"
     
-    def capture_current_screenshot(self, step_index: int, action_type: str) -> Optional[str]:
-        """Capture a screenshot of the current browser state"""
+    def capture_screenshot_direct(self, step_index: int, action_type: str) -> Optional[str]:
+        """
+        Capture screenshot directly from browser connection, independent of agent.
+        This is called after each step completes, using the browser object directly.
+        """
         screenshot_path = self._get_screenshot_path(step_index, action_type)
         try:
-            # Try multiple ways to access the Playwright page
             page = None
             
-            # Method 1: Try to access browser-use's underlying browser/page
-            if self.agent and hasattr(self.agent, 'browser'):
-                browser_obj = self.agent.browser
-                if browser_obj:
-                    # Try different attribute names browser-use might use
-                    if hasattr(browser_obj, 'page'):
-                        page = browser_obj.page
-                    elif hasattr(browser_obj, '_page'):
-                        page = browser_obj._page
-                    elif hasattr(browser_obj, 'context') and hasattr(browser_obj.context, 'pages'):
-                        pages = browser_obj.context.pages
+            # Use browser object directly (not through agent)
+            if self.browser:
+                # Try different ways to access the page
+                if hasattr(self.browser, 'page') and self.browser.page:
+                    page = self.browser.page
+                elif hasattr(self.browser, '_page') and self.browser._page:
+                    page = self.browser._page
+                elif hasattr(self.browser, 'context') and self.browser.context:
+                    if hasattr(self.browser.context, 'pages'):
+                        pages = self.browser.context.pages
                         if pages:
                             page = pages[0]
-            
-            # Method 2: Try to access via browser attribute
-            if not page and self.browser:
-                if hasattr(self.browser, 'page'):
-                    page = self.browser.page
-                elif hasattr(self.browser, '_page'):
-                    page = self.browser._page
-                elif hasattr(self.browser, 'context') and hasattr(self.browser.context, 'pages'):
-                    pages = self.browser.context.pages
-                    if pages:
-                        page = pages[0]
-            
-            # Method 3: Try to get page from browser-use's internal state
-            if not page and self.agent:
-                # browser-use might store page in different places
-                for attr in ['_browser', 'browser', '_context']:
-                    if hasattr(self.agent, attr):
-                        obj = getattr(self.agent, attr)
-                        if obj and hasattr(obj, 'page'):
-                            page = obj.page
-                            break
-                        elif obj and hasattr(obj, 'context') and hasattr(obj.context, 'pages'):
-                            pages = obj.context.pages
-                            if pages:
-                                page = pages[0]
-                                break
+                    elif hasattr(self.browser.context, 'page'):
+                        page = self.browser.context.page
             
             if page:
                 page.screenshot(path=str(screenshot_path))
-                print(f"   📸 Screenshot captured: {screenshot_path}")
                 return str(screenshot_path)
             else:
-                print(f"   ⚠️  Warning: Could not access browser page to capture screenshot")
+                print(f"   ⚠️  Warning: Could not access browser page for screenshot")
                 return None
         except Exception as e:
             print(f"   ⚠️  Warning: Could not capture screenshot: {e}")
-            import traceback
-            traceback.print_exc()
             return None
+    
+    def capture_current_screenshot(self, step_index: int, action_type: str) -> Optional[str]:
+        """Capture a screenshot of the current browser state (legacy method, uses capture_screenshot_direct)"""
+        return self.capture_screenshot_direct(step_index, action_type)
     
     def get_current_url(self) -> Optional[str]:
         """Get the current page URL"""

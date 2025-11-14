@@ -9,6 +9,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -42,6 +43,65 @@ def _kill_existing_brave_processes(user_data_dir: Optional[str] = None) -> None:
                 os.remove(marker_path)
         except Exception:
             pass
+
+
+def capture_screenshot_via_cdp(
+    cdp_url: str,
+    step_index: int,
+    action_type: str,
+    task_name: str,
+    screenshot_dir: str = "screenshots"
+) -> Optional[str]:
+    """
+    Capture screenshot directly via Playwright CDP connection.
+    This is independent of browser-use and works directly with the browser.
+    
+    Args:
+        cdp_url: Chrome DevTools Protocol URL (e.g., "http://localhost:9222")
+        step_index: Step number for filename
+        action_type: Type of action (for filename)
+        task_name: Task name (for filename)
+        screenshot_dir: Directory to save screenshots
+        
+    Returns:
+        Path to saved screenshot, or None if failed
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+        
+        screenshot_dir_path = Path(screenshot_dir)
+        screenshot_dir_path.mkdir(exist_ok=True, parents=True)
+        
+        # Generate filename
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe_task = "".join(c for c in task_name[:30] 
+                           if c.isalnum() or c in (' ', '-', '_')).strip().replace(' ', '_')
+        filename = f"step_{step_index:02d}_{action_type}_{safe_task}_{timestamp}.png"
+        screenshot_path = screenshot_dir_path / filename
+        
+        # Connect to browser via CDP
+        playwright = sync_playwright().start()
+        try:
+            browser = playwright.chromium.connect_over_cdp(cdp_url)
+            
+            # Get the first available page
+            if browser.contexts:
+                context = browser.contexts[0]
+                if context.pages:
+                    page = context.pages[0]
+                    page.screenshot(path=str(screenshot_path))
+                    return str(screenshot_path)
+                else:
+                    print(f"   ⚠️  No pages available in browser context")
+            else:
+                print(f"   ⚠️  No browser contexts available")
+        finally:
+            playwright.stop()
+        
+        return None
+    except Exception as e:
+        print(f"   ⚠️  Could not capture screenshot via CDP: {e}")
+        return None
 
 
 def ensure_brave_remote_debugging(port: int = 9222, profile_directory: str = "Default") -> None:
@@ -172,6 +232,9 @@ def run_iterative(
     step_counter = 0
     current_screenshot_path: Optional[str] = None
     
+    # Screenshot directory
+    screenshot_dir = "screenshots"
+    
     print(f"\n{'=' * 70}")
     print(f"🎯 Starting iterative execution: {task}")
     print(f"{'=' * 70}\n")
@@ -180,6 +243,26 @@ def run_iterative(
         while step_counter < max_steps:
             step_counter += 1
             print(f"\n--- Step {step_counter} ---")
+            
+            # Capture screenshot BEFORE asking Agent B (using Playwright CDP directly)
+            # This ensures Agent B sees the current state after the previous action
+            # Skip on step 1 since browser might not exist yet (it's created by first action)
+            if use_real_browser and browser_type.lower() == "brave" and step_counter > 1:
+                try:
+                    time.sleep(0.5)  # Small delay to ensure page is stable after previous action
+                    current_screenshot_path = capture_screenshot_via_cdp(
+                        cdp_url=f"http://localhost:{debug_port}",
+                        step_index=step_counter - 1,
+                        action_type="after_action",
+                        task_name=task,
+                        screenshot_dir=screenshot_dir
+                    )
+                    if current_screenshot_path:
+                        print(f"📸 Current state screenshot: {current_screenshot_path}")
+                    else:
+                        print(f"⚠️  Could not capture screenshot")
+                except Exception as e:
+                    print(f"⚠️  Could not capture screenshot: {e}")
             
             # Agent B decides next action
             print("🤔 Agent B: Analyzing current state and deciding next action...")
@@ -221,8 +304,31 @@ def run_iterative(
                     step_index=step_counter,
                 )
                 
+                # Capture screenshot AFTER action completes (using Playwright CDP directly)
+                # This is the state that will be analyzed in the next iteration
+                screenshot_path = None
+                if use_real_browser and browser_type.lower() == "brave":
+                    try:
+                        time.sleep(0.5)  # Small delay to ensure page is stable
+                        screenshot_path = capture_screenshot_via_cdp(
+                            cdp_url=f"http://localhost:{debug_port}",
+                            step_index=step_counter,
+                            action_type=next_action.action_type,
+                            task_name=task,
+                            screenshot_dir=screenshot_dir
+                        )
+                        if screenshot_path:
+                            print(f"   📸 Screenshot saved: {screenshot_path}")
+                        else:
+                            print(f"   ⚠️  Could not capture screenshot")
+                    except Exception as e:
+                        print(f"   ⚠️  Could not capture screenshot: {e}")
+                
+                # Store screenshot path in result
+                result["result"]["screenshot_path"] = screenshot_path
+                current_screenshot_path = screenshot_path
+                
                 execution_history.append(result)
-                current_screenshot_path = result["result"].get("screenshot_path")
                 
                 status = result["result"].get("status")
                 print(f"   Status: {status}")
@@ -232,14 +338,13 @@ def run_iterative(
                     print(f"   Error: {error_msg}")
                     # Continue anyway - Agent B can adapt
                 
-                if current_screenshot_path:
-                    print(f"   📸 Screenshot saved: {current_screenshot_path}")
-                
             except Exception as e:
                 print(f"❌ Agent A execution error: {e}")
                 import traceback
                 traceback.print_exc()
+                
                 # Add error to history so Agent B can adapt
+                # Screenshot was already captured before this step
                 execution_history.append({
                     "step_index": step_counter,
                     "action_type": next_action.action_type,
@@ -247,7 +352,7 @@ def run_iterative(
                     "result": {
                         "status": "error",
                         "error_message": str(e),
-                        "screenshot_path": current_screenshot_path,
+                        "screenshot_path": current_screenshot_path,  # Use the screenshot from before this action
                     }
                 })
                 # Continue - let Agent B decide how to recover
