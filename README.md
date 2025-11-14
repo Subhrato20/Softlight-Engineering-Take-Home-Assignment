@@ -20,7 +20,7 @@ User Task → Orchestrator → Agent B (Planner) → Agent A (Executor) → Brow
 - **Vision-Based Planning**: GPT-4o analyzes UI screenshots semantically
 - **Iterative Loop**: Adapts to dynamic UI states (modals, forms, etc.)
 - **Independent Screenshots**: Playwright CDP capture (separate from browser-use)
-- **Real Browser**: Works with your Brave/Chrome profile via CDP
+- **Real Browser**: Works with your Brave profile via CDP
 - **Beautiful CLI**: Interactive interface with rich formatting
 - **Generalizable**: Works with any web app, no hardcoded selectors
 
@@ -29,7 +29,7 @@ User Task → Orchestrator → Agent B (Planner) → Agent A (Executor) → Brow
 - Python 3.12+
 - Brave Browser or Chrome
 - OpenAI API key (`OPENAI_API_KEY`)
-- Browser-use API key (optional, `BROWSER_USE_API_KEY`)
+- Browser-use API key (`BROWSER_USE_API_KEY`)
 
 ## 🚀 Quick Start
 
@@ -41,6 +41,7 @@ User Task → Orchestrator → Agent B (Planner) → Agent A (Executor) → Brow
 2. **Set up `.env`**:
    ```bash
    OPENAI_API_KEY=your_key_here
+   BROWSER_USE_API_KEY=your_key_here
    ```
 
 3. **Run the CLI**:
