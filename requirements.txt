@@ -6,5 +6,6 @@ browser-use>=0.1.0
 selenium>=4.24.0
 webdriver-manager>=4.0.2
 undetected-chromedriver>=3.5.0
+rich>=13.0.0
 
 
