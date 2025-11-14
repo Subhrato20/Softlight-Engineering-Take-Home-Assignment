@@ -66,17 +66,6 @@ User Task → Orchestrator → Agent B (Planner) → Agent A (Executor) → Brow
 - **browser-use**: Execution (actions, element finding)
 - **Playwright**: Screenshots (direct CDP, independent)
 
-## 📁 Project Structure
-
-```
-src/
-├── agentA/          # Executor (browser-use)
-├── agentB/          # Planner (GPT-4o vision)
-├── orchestrator.py  # Main loop + screenshot capture
-└── cli.py          # Interactive CLI
-screenshots/         # Captured UI states
-```
-
 ## 🛠️ Troubleshooting
 
 **Screenshots not capturing?**
